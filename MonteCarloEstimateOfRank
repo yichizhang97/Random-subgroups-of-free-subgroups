@@ -1,0 +1,172 @@
+# Monte Carlo estimate of P(rank == k) for k random reduced words length <= l in F(a,b).
+
+import random, math
+from collections import defaultdict
+
+# -- utilities for reduced words ----------------------------------------------
+INV = {'a':'A','A':'a','b':'B','B':'b'}
+def inv_label(lbl): return INV[lbl]
+
+def count_reduced_words_leq(l):
+    return 2 * (3 ** l) - 1
+
+def sample_reduced_word_of_length(n):
+    if n == 0: return []
+    first = random.choice(['a','A','b','B'])
+    word = [first]
+    for i in range(1,n):
+        forbidden = INV[word[-1]]
+        choices = [c for c in ['a','A','b','B'] if c != forbidden]
+        word.append(random.choice(choices))
+    return word
+
+def sample_reduced_word_maxlen(l):
+    # uniform over all reduced words of length <= l (including identity)
+    if l < 0: return []
+    total = count_reduced_words_leq(l)
+    r = random.randrange(total)
+    if r == 0: return []
+    cum = 1
+    for n in range(1, l+1):
+        cnt_n = 4 * (3 ** (n-1))
+        if r < cum + cnt_n:
+            return sample_reduced_word_of_length(n)
+        cum += cnt_n
+    return sample_reduced_word_of_length(l)
+
+# -- Stallings graph with folding (generators are loops at base) --------------
+class StallingsGraph:
+    def __init__(self):
+        self.next_vertex = 0
+        self.base = self._new_vertex()
+        self.edges = set()
+    def _new_vertex(self):
+        v = self.next_vertex
+        self.next_vertex += 1
+        return v
+    def add_generator_loop(self, word):
+        # Add generator as a loop based at base (word is list of labels)
+        if not word: return
+        cur = self.base
+        n = len(word)
+        for i,lbl in enumerate(word):
+            nxt = self.base if i == n-1 else self._new_vertex()
+            self._add_edge(cur, lbl, nxt)
+            cur = nxt
+    def _add_edge(self, u, lbl, v):
+        self.edges.add((u,lbl,v))
+        self.edges.add((v, inv_label(lbl), u))
+    def fold(self):
+        parent = list(range(self.next_vertex))
+        rank = [0]*self.next_vertex
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+        def union(a,b):
+            ra, rb = find(a), find(b)
+            if ra == rb: return False
+            if rank[ra] < rank[rb]: parent[ra] = rb
+            elif rank[rb] < rank[ra]: parent[rb] = ra
+            else:
+                parent[rb] = ra
+                rank[ra] += 1
+            return True
+        def rebuild_edges():
+            new_edges = set()
+            for (u,lbl,v) in self.edges:
+                new_edges.add((find(u), lbl, find(v)))
+            self.edges = new_edges
+        changed = True
+        while changed:
+            changed = False
+            rebuild_edges()
+            by_start_label = defaultdict(list)
+            for (u,lbl,v) in list(self.edges):
+                by_start_label[(u,lbl)].append(v)
+            for (u,lbl), targets in by_start_label.items():
+                if len(targets) > 1:
+                    t0 = targets[0]
+                    for t in targets[1:]:
+                        if find(t) != find(t0):
+                            union(t, t0)
+                            changed = True
+            if changed: continue
+            by_end_label = defaultdict(list)
+            for (u,lbl,v) in list(self.edges):
+                by_end_label[(v,lbl)].append(u)
+            for (v,lbl), starts in by_end_label.items():
+                if len(starts) > 1:
+                    s0 = starts[0]
+                    for s in starts[1:]:
+                        if find(s) != find(s0):
+                            union(s, s0)
+                            changed = True
+        comp_vertices = set(find(v) for v in range(self.next_vertex))
+        new_id = {v:i for i,v in enumerate(sorted(comp_vertices))}
+        self.base = new_id[find(self.base)]
+        final_edges = set()
+        for (u,lbl,v) in self.edges:
+            final_edges.add((new_id[find(u)], lbl, new_id[find(v)]))
+        self.edges = final_edges
+        self.next_vertex = len(new_id)
+    def simplify(self):
+        adj = defaultdict(list)
+        for (u,lbl,v) in self.edges:
+            adj[u].append(v)
+        visited = set()
+        stack = [self.base]
+        while stack:
+            x = stack.pop()
+            if x in visited: continue
+            visited.add(x)
+            for w in adj.get(x,[]):
+                if w not in visited: stack.append(w)
+        self.edges = set(e for e in self.edges if e[0] in visited and e[2] in visited)
+        verts = sorted(visited)
+        idmap = {v:i for i,v in enumerate(verts)}
+        self.edges = set((idmap[u],lbl,idmap[v]) for (u,lbl,v) in self.edges)
+        self.base = idmap[self.base]
+        self.next_vertex = len(verts)
+    def compute_rank(self):
+        E_dir = len(self.edges)
+        E_undir = E_dir // 2
+        V = self.next_vertex
+        return E_undir - V + 1
+
+# -- sampling + single-run rank computation ----------------------------------
+def sample_generators_and_rank(l, k):
+    gens = [sample_reduced_word_maxlen(l) for _ in range(k)]
+    G = StallingsGraph()
+    for w in gens:
+        G.add_generator_loop(w)
+    G.fold()
+    G.simplify()
+    return G.compute_rank()
+
+# -- Monte Carlo estimator ---------------------------------------------------
+def estimate_prob_rank_equals_k(l, k, n_trials=1000, seed=None, verbose=False):
+    if seed is not None: random.seed(seed)
+    count = 0
+    for i in range(n_trials):
+        r = sample_generators_and_rank(l,k)
+        if r == k:
+            count += 1
+        if verbose and (i+1) % max(1, n_trials//10) == 0:
+            print(f"{i+1}/{n_trials}: current p_hat = {count/(i+1):.4f}")
+    p_hat = count / n_trials
+    se = math.sqrt(p_hat*(1-p_hat)/n_trials) if n_trials>0 else float('nan')
+    z = 1.96
+    ci = (max(0.0, p_hat - z*se), min(1.0, p_hat + z*se))
+    return {'p_hat': p_hat, 'se': se, '95%_CI': ci, 'count': count, 'n_trials': n_trials}
+
+# ------------------ example driver -------------------------------------------
+if __name__ == "__main__":
+    # user-tweakable parameters:
+    l = 6
+    k = 3
+    n_trials = 1000
+    res = estimate_prob_rank_equals_k(l, k, n_trials=n_trials, seed=123, verbose=True)
+    print("\nMonte Carlo estimate result:")
+    print(res)
